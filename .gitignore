@@ -1,0 +1,35 @@
+# --- dependencies
+node_modules/
+
+# --- env & secrets
+.env
+.env.local
+.env.*.local
+
+# --- logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# --- build & caches (only if you ever create them)
+dist/
+build/
+coverage/
+.nyc_output/
+.tmp/
+.cache/
+.eslintcache
+
+# --- OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- misc runtime files
+*.pid
+*.pid.lock

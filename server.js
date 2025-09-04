@@ -1,5 +1,8 @@
 // server.js
+// Backend for KK with Firebase Phone Auth + Postgres profiles
+
 require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -8,15 +11,15 @@ const admin = require('firebase-admin');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-/* --------------------------- CORS --------------------------- */
+/* ============================ CORS ============================ */
 app.use(
   cors({
+    // allow curl/Postman/no-origin
     origin: (origin, cb) => {
-      // allow curl/Postman/no-origin
       if (!origin) return cb(null, true);
       // any localhost:<port> in dev
       if (/^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin)) return cb(null, true);
-      // allow one prod origin if provided
+      // single prod origin if provided
       if (process.env.CORS_ORIGIN && origin === process.env.CORS_ORIGIN) return cb(null, true);
       return cb(new Error('Not allowed by CORS'));
     },
@@ -25,7 +28,9 @@ app.use(
 );
 app.use(express.json({ limit: '1mb' }));
 
-/* ------------------------- Postgres ------------------------- */
+/* ============================ DB ============================= */
+// Render external Postgres typically needs SSL from local/dev.
+// On Render, SSL with rejectUnauthorized:false is fine.
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl:
@@ -49,12 +54,16 @@ async function initDb() {
 
     create or replace function set_updated_at()
     returns trigger as $$
-    begin new.updated_at = now(); return new; end;
+    begin
+      new.updated_at = now();
+      return new;
+    end;
     $$ language plpgsql;
 
     drop trigger if exists trg_users_updated on users;
-    create trigger trg_users_updated before update on users
-    for each row execute procedure set_updated_at();
+    create trigger trg_users_updated
+      before update on users
+      for each row execute procedure set_updated_at();
   `);
   console.log('✅ DB ready');
 }
@@ -63,52 +72,88 @@ initDb().catch((e) => {
   process.exit(1);
 });
 
-/* ------------------- Firebase Admin (optional) --------------- */
+/* ====================== Firebase Admin ======================= */
 /**
- * If AUTH_REQUIRED !== 'false', we verify Firebase ID tokens.
- * Set these env vars from your Service Account:
- *   FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY
- * Make sure FIREBASE_PRIVATE_KEY keeps newlines escaped (\\n) in Render.
+ * Use ONE of these on Render (Environment settings):
+ *  A) FIREBASE_SERVICE_ACCOUNT_BASE64 = base64(serviceAccount.json)
+ *     (recommended)
+ *  B) FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY
+ *     (PRIVATE_KEY may contain \n escapes; we handle that)
+ *
+ * Toggle auth requirement:
+ *   AUTH_REQUIRED=false   -> dev mode (no token verification)
+ *   (omit or true)        -> verify Firebase ID tokens (recommended for prod)
  */
 const AUTH_REQUIRED = process.env.AUTH_REQUIRED !== 'false';
 
-if (AUTH_REQUIRED) {
+function initFirebaseAdmin() {
+  if (!AUTH_REQUIRED) {
+    console.log('🔓 AUTH_REQUIRED=false — dev mode (no Firebase token check)');
+    return; // skip admin init in dev mode
+  }
+
   try {
-    admin.initializeApp({
-      credential: admin.credential.cert({
-        projectId: process.env.FIREBASE_PROJECT_ID,
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        privateKey: (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
-      }),
-    });
-    console.log('🔐 Firebase Admin initialized (auth required)');
-  } catch (e) {
-    console.error('Firebase Admin init failed:', e.message);
+    if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
+      const json = Buffer.from(
+        process.env.FIREBASE_SERVICE_ACCOUNT_BASE64,
+        'base64'
+      ).toString('utf8');
+      const sa = JSON.parse(json);
+      admin.initializeApp({ credential: admin.credential.cert(sa) });
+      console.log('✅ Firebase Admin initialized (base64)');
+      return;
+    }
+
+    const pid = process.env.FIREBASE_PROJECT_ID;
+    const email = process.env.FIREBASE_CLIENT_EMAIL;
+    let key = process.env.FIREBASE_PRIVATE_KEY;
+
+    if (pid && email && key) {
+      // handle \n escape sequences and possible surrounding quotes
+      if (key.startsWith('"') && key.endsWith('"')) {
+        key = key.slice(1, -1);
+      }
+      key = key.replace(/\\n/g, '\n');
+
+      admin.initializeApp({
+        credential: admin.credential.cert({
+          project_id: pid,
+          client_email: email,
+          private_key: key,
+        }),
+      });
+      console.log('✅ Firebase Admin initialized (separate env vars)');
+      return;
+    }
+
+    throw new Error('No Firebase Admin credentials found in env');
+  } catch (err) {
+    console.error('❌ Firebase Admin init failed:', err?.message || err);
     process.exit(1);
   }
-} else {
-  console.log('🔓 AUTH_REQUIRED=false — dev mode (no Firebase token check)');
 }
+initFirebaseAdmin();
 
+/* ===================== Auth Middleware ======================= */
 async function requireAuth(req, res, next) {
-  if (!AUTH_REQUIRED) return next(); // dev mode; not verifying token
+  if (!AUTH_REQUIRED) return next(); // dev mode
 
-  const auth = req.headers.authorization || '';
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'missing_token' });
 
   try {
     const decoded = await admin.auth().verifyIdToken(token);
-    req.auth = decoded; // contains phone_number (from Firebase)
+    req.auth = decoded; // contains phone_number (E.164) if using phone auth
     return next();
   } catch (e) {
-    console.error('ID token verify failed:', e.message);
+    console.error('ID token verify failed:', e?.message || e);
     return res.status(401).json({ error: 'invalid_token' });
   }
 }
 
-/* --------------------------- Routes -------------------------- */
-app.get('/', (_req, res) => res.send('KK backend OK'));
+/* =========================== Routes ========================== */
+app.get('/', (_req, res) => res.send('KK backend OK (Firebase)'));
 
 app.get('/db', async (_req, res) => {
   const r = await pool.query('select now() as now');
@@ -117,13 +162,13 @@ app.get('/db', async (_req, res) => {
 
 /**
  * GET /me
- * - If AUTH_REQUIRED=true   -> use phone from verified Firebase token
- * - If AUTH_REQUIRED=false  -> accept ?phone= for dev
+ *  - PROD (AUTH_REQUIRED=true): phone from Firebase token (req.auth.phone_number)
+ *  - DEV  (AUTH_REQUIRED=false): pass ?phone=+65xxxx
  */
 app.get('/me', requireAuth, async (req, res) => {
   try {
     const phone = AUTH_REQUIRED
-      ? (req.auth?.phone_number || req.auth?.phoneNumber)
+      ? (req.auth?.phone_number || req.auth?.phoneNumber || null)
       : (req.query.phone || null);
 
     if (!phone) return res.status(400).json({ error: 'missing_phone' });
@@ -139,12 +184,13 @@ app.get('/me', requireAuth, async (req, res) => {
 /**
  * PUT /me
  * Body: { fullName?, age?, address?, avatarUrl? }
- * - Phone is derived from token (auth) or from body (dev).
+ *  - PROD: phone comes from Firebase token
+ *  - DEV : include phone in body
  */
 app.put('/me', requireAuth, async (req, res) => {
   try {
     const phone = AUTH_REQUIRED
-      ? (req.auth?.phone_number || req.auth?.phoneNumber)
+      ? (req.auth?.phone_number || req.auth?.phoneNumber || null)
       : (req.body?.phone || null);
 
     if (!phone) return res.status(400).json({ error: 'missing_phone' });
@@ -169,5 +215,5 @@ app.put('/me', requireAuth, async (req, res) => {
   }
 });
 
-/* --------------------------- Boot ---------------------------- */
+/* ========================== Boot ============================= */
 app.listen(PORT, () => console.log(`API running on http://localhost:${PORT}`));
